@@ -1,4 +1,4 @@
-@provider {"id":"sezonlukdizi-proxy","name":"SezonlukDizi (Proxy)","types":["tv"],"domain":"sezonlukdizi.cc","formats":["m3u8"],"sample":"tt0903747:tv:1:1"}
+// @provider {"id":"sezonlukdizi-proxy","name":"SezonlukDizi (Proxy)","types":["tv"],"domain":"sezonlukdizi.cc","formats":["m3u8"],"sample":"tt0903747:tv:1:1"}
 (function () {
   var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36";
   var BASE = "https://sezonlukdizi.cc";
