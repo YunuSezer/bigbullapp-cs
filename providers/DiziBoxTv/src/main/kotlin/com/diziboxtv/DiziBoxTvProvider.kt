@@ -1,5 +1,8 @@
 package com.diziboxtv
 
+import com.bigbull.common.browserHeaders
+import com.bigbull.common.posterSrcLazy
+import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -29,9 +32,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 
-private fun org.jsoup.nodes.Element.posterSrcLazy(): String? =
-    attr("data-src").takeIf { it.isNotBlank() } ?: attr("src")
-
 private fun asciiFold(value: String): String = value
     .replace('ı', 'i').replace('İ', 'I')
     .replace('ş', 's').replace('Ş', 'S')
@@ -49,11 +49,7 @@ private fun cleanTitle(raw: String?): String = (raw ?: "")
     .trim().trim('-', '–', '|', ',')
 
 class DiziBoxTvProvider : MainAPI() {
-    private val uaHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        "Accept-Language" to "tr-TR,tr;q=0.9",
-    )
+    private val uaHeaders get() = browserHeaders
 
     override var mainUrl = "https://diziboxtv.com"
     override var name = "DiziBoxTv"
@@ -140,7 +136,7 @@ class DiziBoxTvProvider : MainAPI() {
         val basePath = url.substringAfter(mainUrl).substringBefore('?').trimEnd('/')
         val slug = basePath.trim('/').split('/').lastOrNull().orEmpty()
         val slugBase = slug.removeSuffix("-izle").removeSuffix("-film-izle")
-        val episodes = doc.select("a[href]").mapNotNull { anchor ->
+        val episodes: MutableList<Episode> = doc.select("a[href]").mapNotNull { anchor ->
             val href = fixUrlNull(anchor.attr("href")) ?: return@mapNotNull null
             val path = href.substringAfter(mainUrl).substringBefore('?')
             if (basePath.isNotBlank() && !path.startsWith(basePath) &&
@@ -154,7 +150,27 @@ class DiziBoxTvProvider : MainAPI() {
                 this.name = anchor.text().trim().ifBlank { "Bölüm $number" }
                 this.episode = number
             }
-        }.distinctBy { it.data }.sortedBy { it.episode ?: 0 }
+        }.distinctBy { it.data }.sortedBy { it.episode ?: 0 }.toMutableList()
+        // Next.js sayfası bölüm listesini RSC içinde basıyor; "5 Sezon · 62 Bölüm"
+        // sayaçlarından sezon/bölüm uzayını sentezle (Nuvio zincirinin CS karşılığı).
+        if (episodes.isEmpty() && url.contains("/dizi/")) {
+            val seasonCount = Regex("""(\d+)\s*Sezon""", RegexOption.IGNORE_CASE).find(raw)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+            val total = Regex("""(\d+)\s*B[öo]l[üu]m""", RegexOption.IGNORE_CASE).find(raw)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            if (total in 2..400) {
+                val per = episodeDistribution(total, seasonCount)
+                var idx = 0
+                for (s in per.indices) {
+                    for (e in 1..per[s]) {
+                        idx++
+                        episodes += newEpisode("$url?sezon=${s + 1}&bolum=$e") {
+                            this.name = "Bölüm $idx"
+                            this.episode = e
+                            this.season = s + 1
+                        }
+                    }
+                }
+            }
+        }
         if (episodes.isNotEmpty()) {
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
@@ -192,8 +208,6 @@ class DiziBoxTvProvider : MainAPI() {
             })
             found = true
         }
-        val known = listOf<String>("https://one.makesomthingup.click/NeLRdzEWjwT6MiwVfFGGB_Xp/master.m3u8", "https://one.makesomthingup.click/NeLRdzEWjwT6MiwVfFGGB_Xp/1080p/playlist.m3u8", "https://one.makesomthingup.click/NeLRdzEWjwT6MiwVfFGGB_Xp/720p/playlist.m3u8", "https://one.makesomthingup.click/NeLRdzEWjwT6MiwVfFGGB_Xp/sub_english/subtitles.m3u8", "https://one.makesomthingup.click/NeLRdzEWjwT6MiwVfFGGB_Xp/turkish/playlist.m3u8")
-        for (u in known) emit(u, "Site", if (u.contains("rumble.com")) "https://rumble.com/" else data)
         val media = Regex("""https?://[^"'\s<>]+?\.(?:m3u8|mp4)(?:\?[^"'\s<>]*)""").findAll(text)
         for (m in media) emit(m.value, "Direct", data)
         val embeds = Regex(""""(?:embedUrl|contentUrl|embed_url|player_url)"\s*:\s*"([^"]+)""")
@@ -214,6 +228,34 @@ class DiziBoxTvProvider : MainAPI() {
             val raw = it.attr("src").ifBlank { it.attr("data-src") }.ifBlank { it.attr("vdo-src") }
             fixUrlNull(raw)
         }.distinct()
+        // diziboxtv şeması: iframe /player/<id> → one.makesomthingup.click/<id>/master.m3u8
+        Regex("""/player/([A-Za-z0-9_-]+)""").find(text)?.groupValues?.get(1)?.let { playerId ->
+            val master = "https://one.makesomthingup.click/$playerId/master.m3u8"
+            val playlist = runCatching { app.get(master, headers = uaHeaders, referer = data).text }.getOrNull() ?: ""
+            if (playlist.startsWith("#EXTM3U")) {
+                emit(master, "master", data)
+                val lines = playlist.lines()
+                for (i in lines.indices) {
+                    if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue
+                    val h = Regex("RESOLUTION=\\d+x(\\d+)").find(lines[i])?.groupValues?.get(1)
+                    var j = i + 1
+                    while (j < lines.size && (lines[j].isBlank() || lines[j].startsWith("#"))) j++
+                    if (j < lines.size) {
+                        emit(java.net.URI(master).resolve(lines[j].trim()).toString(), h?.plus("p") ?: "auto", data)
+                    }
+                }
+                for (s in Regex("#EXT-X-MEDIA:[^\\r\\n]*TYPE=SUBTITLES[^\\r\\n]*").findAll(playlist).take(3)) {
+                    val uri = Regex("URI=\"([^\"]+)\"").find(s.value)?.groupValues?.get(1) ?: continue
+                    val lang = Regex("LANGUAGE=\"([^\"]+)\"").find(s.value)?.groupValues?.get(1)?.lowercase() ?: "tr"
+                    val up2 = java.net.URI(master).resolve(uri).toString()
+                    val body = runCatching { app.get(up2, headers = uaHeaders, referer = data).text }.getOrNull() ?: continue
+                    val vtt = body.lines().firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
+                    if (Settings.subtitleAllowed(lang)) {
+                        subtitleCallback.invoke(SubtitleFile(lang, java.net.URI(up2).resolve(vtt.trim()).toString()))
+                    }
+                }
+            }
+        }
         for (frame in frames) {
             if (frame.contains(".mp4") || frame.contains(".m3u8")) {
                 emit(frame, "Embed", data)
@@ -240,6 +282,14 @@ class DiziBoxTvProvider : MainAPI() {
             throw ErrorLoadingException("$name: oynatılabilir akış yok")
         }
         return found
+    }
+
+    // "62 Bölüm / 5 Sezon" sayaçlarını sezon başına adil dağıt; kalan artış son sezona kalır.
+    private fun episodeDistribution(total: Int, seasons: Int): List<Int> {
+        val s = seasons.coerceAtLeast(1)
+        val base = total / s
+        val rem = total % s
+        return List(s) { base + if (it < rem) 1 else 0 }
     }
 
 }
